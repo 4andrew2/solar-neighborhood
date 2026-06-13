@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milky Way Map</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; color: #e8eef6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; overflow: hidden; height: 100%; }
+  canvas { display: block; }
+  #ui {
+    position: fixed; top: 14px; left: 14px; z-index: 10;
+    display: flex; gap: 10px; align-items: center;
+  }
+  button {
+    background: rgba(15,25,45,0.78); color: #e8eef6; border: 1px solid #2c4a6e;
+    padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    backdrop-filter: blur(6px);
+  }
+  button:hover { background: rgba(35,55,85,0.95); border-color: #4878a8; }
+  button.active { background: rgba(50,95,150,0.95); border-color: #6cb1ff; color: #fff; }
+  .hint { opacity: .55; font-size: 12px; }
+  #info {
+    position: fixed; bottom: 14px; left: 14px; z-index: 10;
+    background: rgba(8,14,26,0.78); padding: 11px 14px; border-radius: 6px;
+    font-size: 13px; max-width: 380px; pointer-events: none;
+    border: 1px solid #1c2c46; backdrop-filter: blur(6px);
+    line-height: 1.45;
+  }
+  #hover {
+    position: fixed; pointer-events: none; z-index: 11;
+    background: rgba(8,14,26,0.92); padding: 8px 11px; border-radius: 4px;
+    font-size: 12px; border: 1px solid #2c4a6e;
+    display: none; line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+  }
+  #scale {
+    position: fixed; top: 14px; right: 14px; z-index: 10;
+    background: rgba(8,14,26,0.78); padding: 8px 12px; border-radius: 6px;
+    font-size: 12px; border: 1px solid #1c2c46; backdrop-filter: blur(6px);
+    font-variant-numeric: tabular-nums;
+  }
+  #scale b { color: #6cb1ff; }
+  #legend {
+    position: fixed; bottom: 14px; right: 14px; z-index: 10;
+    background: rgba(8,14,26,0.78); padding: 10px 13px; border-radius: 6px;
+    font-size: 12px; border: 1px solid #1c2c46; backdrop-filter: blur(6px);
+    line-height: 1.5; pointer-events: none; min-width: 170px;
+  }
+  #legend .title {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    opacity: .65; margin-bottom: 6px;
+  }
+  #legend .row {
+    display: grid; grid-template-columns: 14px 1fr;
+    align-items: center; gap: 8px;
+  }
+  #legend .row.sub { padding-left: 16px; opacity: .85; }
+  #legend .dot {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    justify-self: center;
+  }
+  #legend .group { margin-top: 4px; }
+  #countbar {
+    position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+    z-index: 10; background: rgba(8,14,26,0.78); padding: 9px 14px;
+    border-radius: 6px; border: 1px solid #1c2c46; backdrop-filter: blur(6px);
+    font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+    font-variant-numeric: tabular-nums; min-width: 380px;
+  }
+  #countbar .row {
+    display: grid; grid-template-columns: 150px 220px 1fr;
+    align-items: center; gap: 12px;
+  }
+  #countbar label { opacity: .85; }
+  #countbar b { color: #6cb1ff; }
+  #countbar .hint { opacity: .55; }
+  #countbar input[type=range] {
+    width: 100%; accent-color: #6cb1ff; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+  <div id="ui">
+    <button id="home" title="Reset view">⌂ Home</button>
+    <button id="lines" title="Toggle Sun→star sightlines">⌖ Lines</button>
+    <button id="plane" title="Toggle galactic-plane polar grid">⊕ Plane</button>
+    <button id="planets" class="active" title="Toggle exoplanet-host markers">○ Planets</button>
+    <span class="hint">drag = rotate · wheel = zoom · right-drag = pan</span>
+  </div>
+  <div id="info">Loading solar neighborhood…</div>
+  <div id="hover"></div>
+  <div id="scale">camera distance: <b id="viewdist">—</b></div>
+  <div id="legend" hidden>
+    <div class="title">Planet types</div>
+    <div class="row"><span class="dot" style="background:#facc15"></span>rocky</div>
+    <div class="row sub"><span class="dot" style="background:#a3e635"></span>in habitable zone</div>
+    <div class="row group"><span class="dot" style="background:#4ade80"></span>super-Earth</div>
+    <div class="row sub"><span class="dot" style="background:#15803d"></span>in habitable zone</div>
+    <div class="row group"><span class="dot" style="background:#3b82f6"></span>Neptunian</div>
+    <div class="row"><span class="dot" style="background:#f97316"></span>gas giant</div>
+    <div class="row"><span class="dot" style="background:#ef4444"></span>super-Jupiter</div>
+  </div>
+  <div id="countbar">
+    <div class="row">
+      <label>nearest <b id="countLabel">25,000</b> stars</label>
+      <input type="range" id="countSlider" min="0" max="1000" value="799" step="1" />
+      <span class="hint">~<b id="rangeLabel">— ly</b></span>
+    </div>
+    <div class="row">
+      <label>brightness ×<b id="brightLabel">1.0</b></label>
+      <input type="range" id="brightSlider" min="50" max="500" value="100" step="1" />
+      <span class="hint">0.5× – 5×</span>
+    </div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="./app.js?v=4"></script>
+</body>
+</html>
