@@ -327,17 +327,33 @@ const starSprites = [];
 let visibleStarCount = 25000;
 const planetHostRings = new THREE.Group();
 scene.add(planetHostRings);
-const ringTex = makeRingTexture();
 
-// Ring world-scale is FIXED (in light-years) at creation time. The visible
-// size then comes from camera perspective. To stop rings from blowing up to
-// half-screen when the camera gets close, every frame we cap the OUTERMOST
-// ring's apparent size at RING_MAX_VISUAL × (camera distance to host), and
-// scale the whole host's ring family proportionally — preserving spacing.
+// Rings are LineLoops with FIXED world-radius in light-years. LineBasicMaterial
+// renders at 1 px regardless of distance, so the stroke width is naturally
+// capped in screen-space — solving the old "donut at close range" bug without
+// shrinking the ring (which made it fall into the host star). Per frame we
+// only billboard each ring to face the camera.
 const RING_BASE_WORLD   = 0.35;   // ly  — innermost ring radius
 const RING_STEP_WORLD   = 0.14;   // ly  — added per outer planet
-const RING_MAX_VISUAL   = 0.06;   // outer ring caps at ~6% of cam distance
 const MAX_RINGS_PER_HOST = 6;
+const RING_SEGMENTS     = 96;
+const _ringCircle = (() => {
+  const pts = new Float32Array((RING_SEGMENTS + 1) * 3);
+  for (let i = 0; i <= RING_SEGMENTS; i++) {
+    const a = (i / RING_SEGMENTS) * Math.PI * 2;
+    pts[i * 3]     = Math.cos(a);
+    pts[i * 3 + 1] = Math.sin(a);
+    pts[i * 3 + 2] = 0;
+  }
+  return pts;
+})();
+function makeRingGeometry(radius) {
+  const arr = new Float32Array(_ringCircle.length);
+  for (let i = 0; i < _ringCircle.length; i++) arr[i] = _ringCircle[i] * radius;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  return g;
+}
 
 function addStarSprite(s) {
   const { l, b } = eqToGal(s.ra, s.dec);
@@ -369,42 +385,33 @@ function addStarSprite(s) {
   starSprites.push(sprite);
   _hoverTargets.push(sprite);
 
-  // One concentric ring per planet, colored by classification.
+  // One concentric ring per planet, colored by classification. The dataset
+  // lists planets in NASA-Archive discovery order; sort by semi-major axis
+  // (fall back to orbital period, since P² ∝ a³ preserves the same order)
+  // so ring N actually corresponds to the N-th-closest planet.
   if (s.planets && s.planets.length > 0) {
-    const shown = Math.min(s.planets.length, MAX_RINGS_PER_HOST);
-    sprite.userData.maxRingWorld = RING_BASE_WORLD + RING_STEP_WORLD * (shown - 1);
+    const orbitKey = (pl) => (
+      pl.sma_au   != null ? pl.sma_au :
+      pl.period_d != null ? Math.cbrt(pl.period_d * pl.period_d) :  // ∝ a in solar-mass units
+      Infinity
+    );
+    const ordered = [...s.planets].sort((a, b) => orbitKey(a) - orbitKey(b));
+    const shown = Math.min(ordered.length, MAX_RINGS_PER_HOST);
     for (let i = 0; i < shown; i++) {
-      const cls   = planetClass(s.planets[i], absMag);
-      const color = PLANET_COLORS[cls] ?? PLANET_COLORS.unknown;
-      const ringMat = new THREE.SpriteMaterial({
-        map: ringTex, color,
-        transparent: true, blending: THREE.AdditiveBlending,
-        depthWrite: false, opacity: 0.85,
+      const cls    = planetClass(ordered[i], absMag);
+      const color  = PLANET_COLORS[cls] ?? PLANET_COLORS.unknown;
+      const radius = RING_BASE_WORLD + RING_STEP_WORLD * i;
+      const mat = new THREE.LineBasicMaterial({
+        color, transparent: true, opacity: 0.85,
+        blending: THREE.AdditiveBlending, depthWrite: false,
       });
-      const ring = new THREE.Sprite(ringMat);
+      const ring = new THREE.LineLoop(makeRingGeometry(radius), mat);
       ring.position.set(p.x, p.y, p.z);
-      const ringSz = RING_BASE_WORLD + RING_STEP_WORLD * i;
-      ring.scale.set(ringSz, ringSz, ringSz);
       ring.userData = { host: sprite, ringIndex: i, cls };
       ring.visible = sprite.visible;
       planetHostRings.add(ring);
     }
   }
-}
-
-function makeRingTexture() {
-  const size = 128;
-  const c = document.createElement('canvas');
-  c.width = c.height = size;
-  const ctx = c.getContext('2d');
-  ctx.strokeStyle = 'rgba(255,255,255,1)';
-  ctx.lineWidth = 5;
-  ctx.beginPath();
-  ctx.arc(size/2, size/2, size/2 - 8, 0, Math.PI * 2);
-  ctx.stroke();
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
 }
 
 // ─── Sun→star sightlines (toggle) ────────────────────────────────────────
@@ -452,6 +459,160 @@ function updateSunLineOpacities() {
     a = Math.max(0, Math.min(1, a));
     line.material.opacity = a * LINE_OPACITY_MAX;
   }
+}
+
+// ─── interstellar dust volume (Vergely+ 2022, raymarched) ───────────────
+// Cube extent is in parsecs; world is in light-years. Vergely +Y is the
+// galactic-rotation direction; our galToXYZ uses -sin(l) so app +Y is the
+// anti-rotation direction. The shader flips Y when sampling the texture.
+const LY_PER_PC = 3.2615637769;
+const dustGroup = new THREE.Group();
+dustGroup.visible = false;
+scene.add(dustGroup);
+
+async function loadDustVolume() {
+  const meta = await fetch('./data/dust_cube.json').then(r => r.json());
+  const buf  = new Uint8Array(await fetch('./data/dust_cube.bin').then(r => r.arrayBuffer()));
+  const [nx, ny, nz] = meta.shape;
+  if (buf.length !== nx * ny * nz) {
+    console.warn('dust cube size mismatch', buf.length, nx * ny * nz);
+    return;
+  }
+
+  const tex = new THREE.Data3DTexture(buf, nx, ny, nz);
+  tex.format = THREE.RedFormat;
+  tex.type   = THREE.UnsignedByteType;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.wrapR = tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.unpackAlignment = 1;
+  tex.needsUpdate = true;
+
+  const ex = meta.extent_pc;
+  const texBoxSize = new THREE.Vector3(
+    (ex.x[1] - ex.x[0]) * LY_PER_PC,
+    (ex.y[1] - ex.y[0]) * LY_PER_PC,
+    (ex.z[1] - ex.z[0]) * LY_PER_PC,
+  );
+  // Render box starts at the full extent; setDustClipRadius() shrinks it to
+  // the visible-stars radius once stars finish loading. Texture lookup keeps
+  // using texBoxSize so we crop spatially without stretching the data.
+  const boxSize = texBoxSize.clone();
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uDust:       { value: tex },
+      uBoxSize:    { value: boxSize },
+      uTexBoxSize: { value: texBoxSize },
+      uStepLy:     { value: 8.0 },
+      uMaxSteps:   { value: 160 },
+      uDensity:    { value: 0.005 },
+      uColor:      { value: new THREE.Color(0x9a8466) },
+    },
+    vertexShader: /* glsl */`
+      varying vec3 vLocal;
+      void main() {
+        vLocal = position;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp sampler3D;
+      uniform sampler3D uDust;
+      uniform vec3  uBoxSize;     // render AABB (clipped)
+      uniform vec3  uTexBoxSize;  // full data extent (texture mapping)
+      uniform float uStepLy;
+      uniform int   uMaxSteps;
+      uniform float uDensity;
+      uniform vec3  uColor;
+      varying vec3 vLocal;
+
+      vec2 intersectAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {
+        vec3 inv = 1.0 / rd;
+        vec3 t0 = (bmin - ro) * inv;
+        vec3 t1 = (bmax - ro) * inv;
+        vec3 tmin = min(t0, t1);
+        vec3 tmax = max(t0, t1);
+        return vec2(max(max(tmin.x, tmin.y), tmin.z),
+                    min(min(tmax.x, tmax.y), tmax.z));
+      }
+
+      void main() {
+        // Ray in mesh-local coords. Mesh is at origin with no rotation, so
+        // local == world; this dodges an inverse(modelMatrix) per pixel.
+        vec3 ro = cameraPosition;
+        vec3 rd = normalize(vLocal - ro);
+        vec3 bmin = -uBoxSize * 0.5;
+        vec3 bmax =  uBoxSize * 0.5;
+        vec2 tt = intersectAABB(ro, rd, bmin, bmax);
+        float tStart = max(tt.x, 0.0);
+        float tEnd   = tt.y;
+        if (tEnd <= tStart) discard;
+
+        // Slight per-pixel jitter breaks visible slice banding.
+        float jitter = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+        float t = tStart + jitter * uStepLy;
+
+        vec3 accumCol = vec3(0.0);
+        float accumA  = 0.0;
+        for (int i = 0; i < 512; i++) {
+          if (i >= uMaxSteps || t > tEnd || accumA > 0.985) break;
+          vec3 p = ro + rd * t;
+          // Vergely +Y is rotation; our +Y is anti-rotation → flip on lookup.
+          // Sampling against the FULL data extent, not the clipped render box,
+          // so shrinking uBoxSize crops the volume instead of stretching it.
+          vec3 uvw = vec3(
+             p.x / uTexBoxSize.x + 0.5,
+            -p.y / uTexBoxSize.y + 0.5,
+             p.z / uTexBoxSize.z + 0.5
+          );
+          float d = texture(uDust, uvw).r;
+          float a = 1.0 - exp(-d * uDensity * uStepLy);
+          accumCol += uColor * d * (1.0 - accumA) * a * 0.9;
+          accumA   += (1.0 - accumA) * a;
+          t += uStepLy;
+        }
+        gl_FragColor = vec4(accumCol, accumA);
+      }
+    `,
+    transparent: true,
+    depthWrite:  false,
+    depthTest:   true,
+    side:        THREE.BackSide,
+    blending:    THREE.NormalBlending,
+  });
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(boxSize.x, boxSize.y, boxSize.z), mat);
+  mesh.renderOrder = 5;
+  dustGroup.add(mesh);
+  dustGroup.userData = { mesh, boxSize, texBoxSize };
+  // Match initial clip to whatever the visible-stars radius is right now (may
+  // still be the placeholder if stars haven't streamed in yet — that path is
+  // handled by refreshDustClipFromStars()).
+  refreshDustClipFromStars();
+  console.log('[dust] cube loaded', { shape: meta.shape, texBoxSize, log: meta.log_norm });
+}
+
+// Clip the rendered dust AABB to the slider's current visible-stars radius.
+// `radiusLy` is half the box edge on X/Y; Z stays at the Vergely cube extent
+// since the dust slab is only ±400 pc thick and clipping it shorter would hide
+// most clouds when looking out the galactic plane.
+function setDustClipRadius(radiusLy) {
+  const u = dustGroup.userData;
+  if (!u || !u.mesh) return;
+  const tex = u.texBoxSize;
+  const rxy = Math.max(50, Math.min(radiusLy, tex.x * 0.5));
+  const sxy = rxy * 2;
+  u.boxSize.set(sxy, sxy, tex.z);
+  u.mesh.geometry.dispose();
+  u.mesh.geometry = new THREE.BoxGeometry(sxy, sxy, tex.z);
+}
+
+function refreshDustClipFromStars() {
+  if (!dustGroup.userData.mesh) return;
+  const eff = Math.min(visibleStarCount, starSprites.length);
+  if (eff <= 0) return;
+  const r = starSprites[eff - 1].userData.distLy;
+  setDustClipRadius(r);
 }
 
 // ─── Sun-centered radial grid on galactic plane (toggle) ────────────────
@@ -602,6 +763,13 @@ function updateHover() {
   if (d.isSun) {
     lines.push(`our home star`);
     lines.push(`apparent mag: ${d.vmag} · type: ${d.sp}`);
+  } else if (d.isProbe) {
+    lines.push(`<span class="hint">human-made spacecraft</span>`);
+    lines.push(`launched: ${d.launch}`);
+    lines.push(`distance: ${d.distAu.toLocaleString()} AU  (${(d.distLy * 1000).toFixed(3)} mly)`);
+    lines.push(`escape speed: ${d.spdAuYr} AU/yr`);
+    if (d.lostContact) lines.push(`<span class="hint">contact lost ${d.lostContact}</span>`);
+    lines.push(`heading: ${d.target}`);
   } else {
     lines.push(`distance: ${d.distLy.toFixed(3)} ly  (${(d.distLy/3.26156).toFixed(3)} pc)`);
     const magLabel = d.isCurated ? 'V mag' : 'G mag';
@@ -612,7 +780,13 @@ function updateHover() {
     lines.push(`RA/Dec: ${d.ra.toFixed(3)}°, ${d.dec.toFixed(3)}°`);
     if (d.planets && d.planets.length > 0) {
       lines.push(`<span style="color:#6fe6c8">━ ${d.planets.length} planet${d.planets.length>1?'s':''} ━</span>`);
-      for (const p of d.planets.slice(0, 8)) {
+      const orbitKey = (pl) => (
+        pl.sma_au   != null ? pl.sma_au :
+        pl.period_d != null ? Math.cbrt(pl.period_d * pl.period_d) :
+        Infinity
+      );
+      const ordered = [...d.planets].sort((a, b) => orbitKey(a) - orbitKey(b));
+      for (const p of ordered.slice(0, 8)) {
         const r  = p.radius_e != null ? `${p.radius_e.toFixed(2)} R⊕` : null;
         const m  = p.mass_e   != null ? `${p.mass_e.toFixed(2)} M⊕`   : null;
         const a  = p.sma_au   != null ? `${p.sma_au.toFixed(3)} AU`   : null;
@@ -628,6 +802,84 @@ function updateHover() {
   hover.style.display = 'block';
   hover.style.left = (lastMouse.clientX + 14) + 'px';
   hover.style.top  = (lastMouse.clientY + 14) + 'px';
+}
+
+// ─── interstellar probes ───────────────────────────────────────────────
+// Five spacecraft on hyperbolic escape trajectories. Distances and asymptotic
+// heading vectors are approximate as of June 2026 (Voyager/NH telemetry,
+// Pioneers extrapolated forward from their last contacts). Past path is shown
+// as a solid line from the Sun to the current position (a fine simplification
+// at this zoom — all gravity-assist wiggling happened inside ~100 AU); future
+// projection is a dashed extension capped at PROBE_FUTURE_CAP_AU because the
+// orbit is hyperbolic and extends to infinity otherwise.
+const LY_PER_AU = 1.58125074e-5;
+const PROBE_FUTURE_CAP_AU = 50000;  // ~0.79 ly forward — visible at local-neighbourhood zoom
+const PROBES = [
+  { name: 'Voyager 1',    launch: '1977-09-05', distAu: 167, ra: 258.5, dec:  12, spdAuYr: 3.58, color: 0xff9466, target: 'Gliese 445 flyby in ~40,000 yr (Ophiuchus)' },
+  { name: 'Voyager 2',    launch: '1977-08-20', distAu: 141, ra: 298.0, dec: -55, spdAuYr: 3.24, color: 0xffc066, target: 'Ross 248 flyby in ~40,000 yr (Telescopium)' },
+  { name: 'Pioneer 10',   launch: '1972-03-03', distAu: 136, ra:  76.0, dec:  26, spdAuYr: 2.51, color: 0x9cb8ff, target: 'Aldebaran direction (~2 Myr)', lostContact: 2003 },
+  { name: 'Pioneer 11',   launch: '1973-04-06', distAu: 115, ra: 283.0, dec:  -8, spdAuYr: 2.36, color: 0xaae6ff, target: 'λ Aquilae direction', lostContact: 1995 },
+  { name: 'New Horizons', launch: '2006-01-19', distAu:  63, ra: 292.0, dec: -20, spdAuYr: 2.93, color: 0xff7aa0, target: 'galactic-anticenter region' },
+];
+const probesGroup = new THREE.Group();
+probesGroup.visible = false;
+scene.add(probesGroup);
+const probeMarkers = [];
+
+function makeProbeDotTex() {
+  const size = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+  g.addColorStop(0.0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.35, 'rgba(255,255,255,0.55)');
+  g.addColorStop(1.0, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const probeDotTex = makeProbeDotTex();
+
+for (const p of PROBES) {
+  const { l, b } = eqToGal(p.ra, p.dec);
+  const dir = galToXYZ(l, b, 1.0);            // unit vector in app world coords
+  const curLy = p.distAu * LY_PER_AU;
+  const capLy = curLy + PROBE_FUTURE_CAP_AU * LY_PER_AU;
+  const curPos = new THREE.Vector3(dir.x * curLy, dir.y * curLy, dir.z * curLy);
+  const capPos = new THREE.Vector3(dir.x * capLy, dir.y * capLy, dir.z * capLy);
+
+  const past = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), curPos]),
+    new THREE.LineBasicMaterial({ color: p.color, transparent: true, opacity: 0.85 }),
+  );
+
+  // LineDashedMaterial dash/gap are in WORLD units. Future leg is ~0.79 ly; a
+  // ~0.012 ly dash gives ~65 segments — readable as a dashed line at all but
+  // extreme zoom-out. computeLineDistances() is required for dashes to show.
+  const fut = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([curPos, capPos]),
+    new THREE.LineDashedMaterial({
+      color: p.color, transparent: true, opacity: 0.55,
+      dashSize: 0.012, gapSize: 0.008,
+    }),
+  );
+  fut.computeLineDistances();
+
+  const marker = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: probeDotTex, color: p.color,
+    transparent: true, blending: THREE.AdditiveBlending,
+    depthWrite: false, opacity: 0.95,
+  }));
+  marker.position.copy(curPos);
+  marker.userData = { ...p, isProbe: true, distLy: curLy };
+  marker.visible = false;  // synced with probesGroup by the Probes toggle
+
+  probesGroup.add(past, fut, marker);
+  probeMarkers.push(marker);
+  _hoverTargets.push(marker);
 }
 
 // ─── home button (smooth easing back to start) ───────────────────────────
@@ -662,9 +914,24 @@ planeBtn.addEventListener('click', () => {
 });
 
 const planetsBtn = document.getElementById('planets');
+const legendEl = document.getElementById('legend');
 planetsBtn.addEventListener('click', () => {
   planetHostRings.visible = !planetHostRings.visible;
   planetsBtn.classList.toggle('active', planetHostRings.visible);
+  legendEl.hidden = !planetHostRings.visible;
+});
+
+const cloudsBtn = document.getElementById('clouds');
+cloudsBtn.addEventListener('click', () => {
+  dustGroup.visible = !dustGroup.visible;
+  cloudsBtn.classList.toggle('active', dustGroup.visible);
+});
+
+const probesBtn = document.getElementById('probes');
+probesBtn.addEventListener('click', () => {
+  probesGroup.visible = !probesGroup.visible;
+  for (const m of probeMarkers) m.visible = probesGroup.visible;
+  probesBtn.classList.toggle('active', probesGroup.visible);
 });
 
 // ─── visible-count slider (log-scale 100 → 100,000, default 25,000) ──────
@@ -687,6 +954,7 @@ function refreshCountLabel(n) {
   } else {
     rangeLabel.textContent = '— ly';
   }
+  refreshDustClipFromStars();
 }
 countSlider.addEventListener('input', () => {
   const n = sliderToCount(+countSlider.value);
@@ -754,19 +1022,24 @@ function applyStarSizes() {
 function updateStarsForCamera() {
   _camPos.copy(camera.position);
 
-  // Cap each ring's APPARENT size when the camera gets close, while keeping
-  // relative spacing between rings of the same host. For host at distance D
-  // from camera, allow outer ring visual ≤ RING_MAX_VISUAL × D ⇒ scale all
-  // rings of that host by min(1, RING_MAX_VISUAL × D / outer-designed).
+  // Billboard each ring to face the camera. World-radius stays fixed (in ly),
+  // so rings grow on screen as the camera approaches — the host sprite no
+  // longer overtakes them. Line width stays at ~1 px via LineBasicMaterial,
+  // so the ring reads as a thin circle at any zoom (no more donuts).
   for (const ring of planetHostRings.children) {
-    const host = ring.userData.host;
-    if (!host) continue;
-    const designed = RING_BASE_WORLD + RING_STEP_WORLD * ring.userData.ringIndex;
-    const maxDesigned = host.userData.maxRingWorld || designed;
-    const dHost = Math.max(_camPos.distanceTo(host.position), 0.001);
-    const factor = Math.min(1, (RING_MAX_VISUAL * dHost) / maxDesigned);
-    const sz = designed * factor;
-    ring.scale.set(sz, sz, sz);
+    ring.quaternion.copy(camera.quaternion);
+  }
+
+  // Constant-screen-size probe markers. Without this, the dots sit at sub-
+  // thousandth-ly positions and are invisible from any practical zoom level.
+  // Clamp so they don't grow unbounded at far zoom-out or shrink to a single
+  // pixel when the camera flies inside the cluster.
+  if (probesGroup.visible) {
+    for (const m of probeMarkers) {
+      const dCam = Math.max(_camPos.distanceTo(m.position), 0.001);
+      const sz = Math.min(Math.max(dCam * 0.014, 0.0008), 5);
+      m.scale.set(sz, sz, sz);
+    }
   }
 }
 
@@ -785,3 +1058,4 @@ loop();
 
 // Kick off streaming load after the first frame is rendered.
 loadStars();
+loadDustVolume().catch(e => console.warn('[dust] load failed', e));
