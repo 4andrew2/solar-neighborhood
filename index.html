@@ -3,12 +3,43 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Solar Neighborhood</title>
+<title>Solar Neighborhood — Interactive 3D star map</title>
+<meta name="description" content="Interactive 3D map of stars within ~250 ly of the Sun: 110,000 GAIA DR3 stars plus curated bright neighbors, exoplanet host markers, the ESO Brunier Milky Way panorama. Built with Three.js.">
+<meta name="author" content="4andrew2">
+<link rel="canonical" href="https://4andrew2.github.io/solar-neighborhood/">
+
+<meta property="og:type"        content="website">
+<meta property="og:site_name"   content="Solar Neighborhood">
+<meta property="og:title"       content="Solar Neighborhood — Interactive 3D star map">
+<meta property="og:description" content="110,000 stars within 250 ly of the Sun, in 3D. GAIA DR3 + curated bright stars + exoplanet hosts, on the ESO Brunier Milky Way panorama.">
+<meta property="og:url"         content="https://4andrew2.github.io/solar-neighborhood/">
+<meta property="og:image"       content="https://4andrew2.github.io/solar-neighborhood/og-card.svg">
+<meta property="og:image:width"  content="1200">
+<meta property="og:image:height" content="630">
+
+<meta name="twitter:card"        content="summary_large_image">
+<meta name="twitter:title"       content="Solar Neighborhood — Interactive 3D star map">
+<meta name="twitter:description" content="110,000 stars within 250 ly of the Sun, in 3D. GAIA DR3 + curated bright stars + exoplanet hosts.">
+<meta name="twitter:image"       content="https://4andrew2.github.io/solar-neighborhood/og-card.svg">
+
 <link rel="icon" type="image/svg+xml" href="./favicon.svg">
 <meta name="theme-color" content="#02041a">
 <style>
   html, body { margin: 0; padding: 0; background: #000; color: #e8eef6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; overflow: hidden; height: 100%; }
   canvas { display: block; }
+  /* Visible to screen readers and crawlers, invisible on screen. */
+  .sr-only {
+    position: absolute !important; width: 1px; height: 1px; padding: 0;
+    margin: -1px; overflow: hidden; clip: rect(0,0,0,0);
+    white-space: nowrap; border: 0;
+  }
+  /* No-JS fallback fills the viewport so search engines see real text. */
+  .noscript-fallback {
+    padding: 56px 28px; max-width: 720px; margin: 0 auto;
+    color: #e8eef6; line-height: 1.6;
+  }
+  .noscript-fallback h1 { font-size: 28px; margin: 0 0 12px; }
+  .noscript-fallback a  { color: #6cb1ff; }
   #ui {
     position: fixed; top: 14px; left: 14px; z-index: 10;
     display: flex; gap: 10px; align-items: center;
@@ -187,6 +218,18 @@
 </style>
 </head>
 <body>
+  <h1 class="sr-only">Solar Neighborhood — Interactive 3D map of stars within 250 light-years of the Sun</h1>
+  <noscript>
+    <div class="noscript-fallback">
+      <h1>Solar Neighborhood</h1>
+      <p>Interactive 3D map of the Sun's stellar neighborhood: 110,000 stars within ~250 light-years sourced from
+        <a href="https://www.cosmos.esa.int/web/gaia/data-release-3">GAIA DR3</a> plus a curated set of nearby bright
+        stars, with exoplanet host markers from the
+        <a href="https://exoplanetarchive.ipac.caltech.edu/">NASA Exoplanet Archive</a>, set against the
+        <a href="https://www.eso.org/public/images/eso0932a/">ESO Brunier Milky Way panorama</a>. Built with Three.js.</p>
+      <p>This site requires JavaScript and WebGL.</p>
+    </div>
+  </noscript>
   <div id="ui">
     <button id="home" title="Reset view">⌂ Home</button>
     <button id="lines" title="Toggle Sun→star sightlines">⌖ Lines</button>
