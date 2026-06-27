@@ -234,9 +234,12 @@ const skyMat = new THREE.MeshBasicMaterial({
 });
 const sky = new THREE.Mesh(new THREE.SphereGeometry(SKY_RADIUS, 64, 32), skyMat);
 // Align: image equator (b=0) → scene z=0 plane (galactic plane).
-// Image center (l=0, galactic centre) → scene +X (where +X points).
+// Image center (l=0, galactic centre) → scene +X. The default sphere
+// already places u=0.5 at local +X; rotating π/2 around X just lifts the
+// north pole from +Y to +Z. A previous Math.PI Z-rotation was flipping the
+// panorama 180° so the bright Sagittarius bulge ended up at -X (where the
+// "anti-GC" label was) — that's been removed.
 sky.rotation.x = Math.PI / 2;
-sky.rotation.z = Math.PI;
 sky.frustumCulled = false;
 scene.add(sky);
 
@@ -372,9 +375,11 @@ const starMat = new THREE.ShaderMaterial({
     uniform float uPxScale;
     uniform float uVisibleCount;
     uniform float uBrightMul;
-    varying vec3 vColor;
+    varying vec3  vColor;
+    varying float vFlux;
     void main() {
       vColor = aColor;
+      vFlux  = 1.0;
       // Slider-hidden stars get pushed outside clip space + zero size.
       if (aIndex >= uVisibleCount) {
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
@@ -384,17 +389,34 @@ const starMat = new THREE.ShaderMaterial({
       vec4 mv = modelViewMatrix * vec4(position, 1.0);
       float depth = max(-mv.z, 0.01);
       // World-size → pixel-size: aSize * (renderH/2) / (tan(fov/2) * depth).
-      float px = aSize * uBrightMul * uPxScale / depth;
-      gl_PointSize = clamp(px, 1.0, 256.0);
+      float pxRaw = aSize * uBrightMul * uPxScale / depth;
+
+      // Soft-knee compression: bright giants were blooming into giant
+      // diffuse discs because √L sizing scales without bound. Beyond a
+      // 6-px threshold, asymptote toward ~22 px, then boost per-pixel
+      // intensity by the squared area ratio so integrated flux (and
+      // therefore perceived brightness) is preserved. Pixels that go
+      // over 1.0 just clamp at the framebuffer — exactly how a bright
+      // star reads in a real photo: tight saturated core, colored halo.
+      const float kneeStart = 6.0;
+      const float kneeMax   = 22.0;
+      float pxOut = pxRaw;
+      if (pxRaw > kneeStart) {
+        float k = (kneeMax - kneeStart);
+        pxOut = kneeStart + k * (1.0 - exp(-(pxRaw - kneeStart) / k));
+        vFlux = (pxRaw * pxRaw) / (pxOut * pxOut);
+      }
+      gl_PointSize = clamp(pxOut, 1.0, 64.0);
       gl_Position = projectionMatrix * mv;
     }
   `,
   fragmentShader: /* glsl */`
     uniform sampler2D uMap;
-    varying vec3 vColor;
+    varying vec3  vColor;
+    varying float vFlux;
     void main() {
       vec4 t = texture2D(uMap, gl_PointCoord);
-      gl_FragColor = vec4(vColor * t.rgb * 0.7, t.a);   // 0.7 matches old sprite opacity
+      gl_FragColor = vec4(vColor * t.rgb * vFlux * 0.7, t.a);   // 0.7 matches old sprite opacity
     }
   `,
   transparent: true,
@@ -547,7 +569,52 @@ function updateSunLineOpacities() {
 
 // ─── Sun-centered radial grid on galactic plane (toggle) ────────────────
 // Concentric circles every 20 ly out to 200 ly (400 ly diameter) + 12 radial
-// spokes. Brighter green for visibility against the dense star field.
+// spokes + numeric labels along the +X (galactic-center) axis and galactic
+// longitude labels around the outer ring.
+function makeTextSprite(text, { color = '#7ee5a8', fontPx = 28, screenPx = 16 } = {}) {
+  const cvs = document.createElement('canvas');
+  const ctx = cvs.getContext('2d');
+  const font = `${fontPx}px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif`;
+  ctx.font = font;
+  const pad = 6;
+  const w = Math.ceil(ctx.measureText(text).width) + pad * 2;
+  const h = fontPx + pad;
+  cvs.width = w; cvs.height = h;
+  // Re-set context state after canvas-size change wipes it
+  ctx.font = font;
+  ctx.fillStyle = color;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, pad, h / 2);
+  const tex = new THREE.CanvasTexture(cvs);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, depthTest: false, depthWrite: false,
+  }));
+  // Actual world scale is updated each frame by updateLabelScales so the
+  // sprite reads at a constant pixel height regardless of camera distance.
+  sprite.userData = { isLabel: true, aspect: w / h, screenPx };
+  return sprite;
+}
+
+// Per-frame label resizing — keeps plane scale ticks at a constant pixel
+// height. A Sprite at world position p projects to screen with
+//   screen_h = world_h * renderH / (2·tan(fov/2)·dist)
+// so to hold screen_h fixed, world_h must scale with dist.
+function updateLabelScales() {
+  if (!galPlane.visible) return;
+  const renderH = renderer.domElement.height;
+  const pxFactor = 2 * Math.tan(camera.fov * Math.PI / 360) / renderH;
+  const cam = camera.position;
+  for (const child of galPlane.children) {
+    const ud = child.userData;
+    if (!ud || !ud.isLabel) continue;
+    const dist = cam.distanceTo(child.position);
+    const wH = ud.screenPx * pxFactor * dist;
+    child.scale.set(wH * ud.aspect, wH, 1);
+  }
+}
+
 const galPlane = new THREE.Group();
 galPlane.visible = false;
 scene.add(galPlane);
@@ -573,6 +640,53 @@ scene.add(galPlane);
     ]);
     galPlane.add(new THREE.Line(geo, spokeMat));
   }
+  // Radial scale on the +X axis (toward galactic center), every 40 ly.
+  for (const r of [40, 80, 120, 160, 200]) {
+    const lbl = makeTextSprite(`${r} ly`, { color: '#5ad99a', fontPx: 32, screenPx: 23 });
+    lbl.position.set(r, 6, 0.1);
+    galPlane.add(lbl);
+  }
+  // Galactic-longitude ticks at 30° increments, on a circle just outside the
+  // outermost ring. l=0 is +X (galactic centre); l grows counterclockwise
+  // when viewed from +Z (NGP), which in scene coords is the -Y direction.
+  const labelR = 218;
+  for (let deg = 0; deg < 360; deg += 30) {
+    const a = deg * Math.PI / 180;
+    const text = deg === 0 ? '0° (GC)' : deg === 180 ? '180° (anti-GC)' : `${deg}°`;
+    const lbl = makeTextSprite(text, { color: '#7ee5a8', fontPx: 28, screenPx: 19 });
+    lbl.position.set(labelR * Math.cos(a), -labelR * Math.sin(a), 0.1);
+    galPlane.add(lbl);
+  }
+}
+
+// ─── projection of a pinned star onto the galactic plane ────────────────
+// Drawn only when the plane is enabled AND a star is pinned. Shows a dashed
+// vertical drop from the star to the plane (visualises galactic latitude /
+// height above the plane) + a radial line from the Sun to the projection.
+const starProjection = new THREE.Group();
+scene.add(starProjection);
+
+function clearStarProjection() {
+  for (const child of starProjection.children) {
+    child.geometry?.dispose?.();
+    child.material?.dispose?.();
+  }
+  starProjection.clear();
+}
+
+function updateStarProjection() {
+  clearStarProjection();
+  if (!galPlane.visible || !pinnedStar || pinnedStar.isSun) return;
+  const x = pinnedStar.gx, y = pinnedStar.gy, z = pinnedStar.gz;
+  // Vertical drop: star → its perpendicular foot on the galactic plane.
+  const dropMat = new THREE.LineBasicMaterial({
+    color: 0x5ad99a, transparent: true, opacity: 0.85,
+  });
+  const dropGeo = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(x, y, z),
+    new THREE.Vector3(x, y, 0),
+  ]);
+  starProjection.add(new THREE.Line(dropGeo, dropMat));
 }
 
 // ─── compass: "→ galactic center" tick on the +X axis ────────────────────
@@ -653,8 +767,8 @@ function setSummary(title, body) {
   summaryBody = body;
   if (!pinnedStar) renderInfoPanel();
 }
-function pinStar(d)  { pinnedStar = d;    renderInfoPanel(); }
-function unpinStar() { pinnedStar = null; renderInfoPanel(); }
+function pinStar(d)  { pinnedStar = d;    renderInfoPanel(); updateStarProjection(); }
+function unpinStar() { pinnedStar = null; renderInfoPanel(); updateStarProjection(); }
 
 infoHead.addEventListener('click', () => infoEl.classList.toggle('collapsed'));
 infoUnpin.addEventListener('click', (e) => { e.stopPropagation(); unpinStar(); });
@@ -703,6 +817,22 @@ function dedupCuratedGaiaOrphans(stars) {
   return drop.size ? stars.filter(s => !drop.has(s)) : stars;
 }
 
+// Any GAIA-only star that still wears its source-id name but happens to host
+// confirmed exoplanets gets renamed to the NASA Archive's `hostname`, which
+// is the human designation (GJ 887, eps Ind A, HD 180617, Teegarden's Star,
+// …). Cheap rename, hundreds of stars become recognisable.
+function promoteHostNames(stars) {
+  let renamed = 0;
+  for (const s of stars) {
+    if (s.isCurated) continue;
+    if (typeof s.name !== 'string' || !s.name.startsWith('Gaia DR3')) continue;
+    if (!s.planets || s.planets.length === 0) continue;
+    const host = s.planets[0].host;
+    if (host && host !== s.name) { s.name = host; renamed++; }
+  }
+  if (renamed) console.log(`[names] promoted ${renamed} GAIA stars to their exoplanet host designation`);
+}
+
 async function loadStars() {
   let data;
   try {
@@ -717,6 +847,7 @@ async function loadStars() {
   // attach_planets binds exoplanets to those orphans instead of the curated
   // entry. Reunite them client-side until the catalog is rebuilt.
   data = dedupCuratedGaiaOrphans(data);
+  promoteHostNames(data);
   STARS = data;
   // Sort ascending by distance so the slider can slice "the N closest" via
   // the uVisibleCount uniform (which simply rejects vertices with aIndex >=
@@ -878,6 +1009,7 @@ const planeBtn = document.getElementById('plane');
 planeBtn.addEventListener('click', () => {
   galPlane.visible = !galPlane.visible;
   planeBtn.classList.toggle('active', galPlane.visible);
+  updateStarProjection();
 });
 
 const planetsBtn = document.getElementById('planets');
@@ -996,6 +1128,7 @@ function loop() {
   sunHalo.position.copy(sun.position); // halo follows sun (here, origin)
   updateStarsForCamera();
   updateSunLineOpacities();
+  updateLabelScales();
   updateHover();
   viewdistEl.textContent = fmtLy(camera.position.distanceTo(controls.target));
   renderer.render(scene, camera);
