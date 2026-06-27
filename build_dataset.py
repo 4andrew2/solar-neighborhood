@@ -171,9 +171,18 @@ def fetch_exoplanets() -> list[dict]:
 
 
 # ── 4. cross-match curated ↔ GAIA  ───────────────────────────────────────
-# Curated coords are SIMBAD J2000; GAIA is J2016. Use 60" tolerance to absorb
-# proper motion for nearby high-PM stars.
-def merge_curated_and_gaia(curated, gaia, match_arcsec: float = 60.0) -> list[dict]:
+# Curated coords are SIMBAD J2000; GAIA is J2016. The 16-yr epoch gap means
+# high-proper-motion stars (Barnard's ~10″/yr, Lalande 21185 ~4.8″/yr,
+# Proxima ~3.85″/yr) drift well past a 60″ window. Accept a tight angular
+# match OR a wider angular match when the distance also agrees within 5 %
+# — distance is a strong same-star check that doesn't depend on epoch.
+def merge_curated_and_gaia(
+    curated,
+    gaia,
+    tight_arcsec: float = 60.0,
+    wide_arcsec:  float = 300.0,
+    dist_tol:     float = 0.05,
+) -> list[dict]:
     if not gaia:
         return [{**c, "isCurated": True, "planets": []} for c in curated]
 
@@ -193,16 +202,27 @@ def merge_curated_and_gaia(curated, gaia, match_arcsec: float = 60.0) -> list[di
         star = dict(c)
         star["isCurated"] = True
         star["planets"]   = []
-        if sep[i].arcsecond < match_arcsec:
-            j = int(idx[i])
+        j = int(idx[i])
+        arc = float(sep[i].arcsecond)
+        g = gaia[j]
+        is_match = arc < tight_arcsec
+        if not is_match and arc < wide_arcsec and c["distLy"] > 0:
+            if abs(g["distLy"] - c["distLy"]) / c["distLy"] < dist_tol:
+                is_match = True
+        if is_match:
             matched_gaia.add(j)
-            g = gaia[j]
             star["bp_rp"]   = g["bp_rp"]
             star["gaia_id"] = g["source_id"]
+            # Adopt GAIA's J2016 position so exoplanet matching (which uses
+            # GAIA-era coords) attaches to this curated entry rather than to
+            # a phantom orphan.
+            star["ra"]  = g["ra"]
+            star["dec"] = g["dec"]
         stars.append(star)
 
     n_curated_matched = len(matched_gaia)
-    print(f"  → {n_curated_matched}/{len(curated)} curated stars matched to GAIA within {match_arcsec}″")
+    print(f"  → {n_curated_matched}/{len(curated)} curated stars matched to GAIA "
+          f"(≤{tight_arcsec}″ direct, or ≤{wide_arcsec}″ with Δd<{int(dist_tol*100)}%)")
 
     for j, g in enumerate(gaia):
         if j in matched_gaia:

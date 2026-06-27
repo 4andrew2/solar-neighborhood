@@ -37,18 +37,22 @@ function galToXYZ(l, b, d) {
 }
 
 // ─── star color from spectral type ───────────────────────────────────────
-// Approximate RGB for OBAFGKM and special classes; tuned to look right on black.
+// sRGB chromaticity of the class-midpoint blackbody temperature, from
+// Mitchell Charity's D58-illuminant lookup table (Lo01/Lhi values normalized
+// so the brightest channel hits 1.0). Verified against Stellarium/Celestia.
+//   O ~30000 K | B ~20000 K | A  ~9000 K | F  ~6700 K | G  ~5800 K
+//   K  ~4500 K | M  ~3000 K
 const SPEC_COLORS = {
   O: [0.61, 0.71, 1.00],
   B: [0.70, 0.80, 1.00],
-  A: [0.85, 0.89, 1.00],
-  F: [1.00, 0.99, 0.95],
-  G: [1.00, 0.95, 0.78],
+  A: [0.84, 0.88, 1.00],
+  F: [1.00, 0.98, 0.95],
+  G: [1.00, 0.95, 0.88],
   K: [1.00, 0.78, 0.55],
-  M: [1.00, 0.55, 0.36],
-  L: [0.85, 0.40, 0.30],
-  T: [0.55, 0.30, 0.40],
-  D: [0.88, 0.94, 1.00],   // white dwarfs — bluish-white default
+  M: [1.00, 0.57, 0.30],
+  L: [0.92, 0.45, 0.28],   // late-M / L brown dwarf, ~2200 K
+  T: [0.78, 0.30, 0.35],   // T brown dwarf, ~1200 K — methane-band dimming
+  D: [0.92, 0.95, 1.00],   // white dwarfs default to ~12000 K continuum
 };
 function colorForSpType(sp) {
   if (!sp) return SPEC_COLORS.G;
@@ -56,15 +60,17 @@ function colorForSpType(sp) {
 }
 
 // GAIA-only stars don't carry a spectral type, but they do carry BP-RP color.
-// Piecewise-linear approximation of (bp_rp → RGB) tuned for additive blending.
+// Piecewise-linear (bp_rp → sRGB), stops chosen so each color index lands on
+// the canonical SPEC_COLORS entry for its temperature: 0 → A (~9000 K),
+// 0.5 → F (~6700 K), 0.82 ≈ Sun, 1.0 → G/early-K, 1.5 → K, 2.5 → M.
 const BP_RP_STOPS = [
   [-0.5, [0.55, 0.70, 1.00]],
-  [ 0.0, [0.82, 0.88, 1.00]],
-  [ 0.5, [1.00, 1.00, 0.95]],
-  [ 1.0, [1.00, 0.92, 0.72]],
-  [ 1.5, [1.00, 0.82, 0.55]],
-  [ 2.5, [1.00, 0.62, 0.40]],
-  [ 4.0, [1.00, 0.45, 0.30]],
+  [ 0.0, [0.84, 0.88, 1.00]],
+  [ 0.5, [1.00, 0.98, 0.95]],
+  [ 1.0, [1.00, 0.95, 0.88]],
+  [ 1.5, [1.00, 0.78, 0.55]],
+  [ 2.5, [1.00, 0.57, 0.30]],
+  [ 4.0, [1.00, 0.40, 0.22]],
 ];
 function colorForBpRp(bp_rp) {
   if (bp_rp == null || isNaN(bp_rp)) return [0.90, 0.92, 1.00];
@@ -96,22 +102,22 @@ function absMagFor(vmag, distLy) {
   return vmag - 5 * (Math.log10(distPc) - 1);
 }
 
-// Used at sprite creation time (initial scale before the first per-frame update).
-function sizeForMag(vmag, distLy, { dim = false } = {}) {
-  return sizeForAppMag(absMagFor(vmag, distLy), dim);
-}
+// True L/r² rendering:
+//   L (solar) = 10^(-0.4·(M − M_sun))     → √L = 10^(0.2·(M_sun − M))
+//   world_size  = REF_SIZE · √L
+//   on-screen   = world_size / r   (perspective projection)
+//   so on-screen flux ∝ size² / r² ∝ L / r²  ✓
+// REF_SIZE is the size for an M = M_sun (G2V) star; nudged so the Sun reads
+// as a small but visible disc at the home distance (≈22 ly camera target).
+// VIS_FLOOR keeps the dimmest M dwarfs as a sub-pixel dot rather than
+// vanishing entirely. MAX_SIZE caps blue giants so they don't fill the view.
+const REF_SIZE  = 0.12;
+const VIS_FLOOR = 0.012;
+const MAX_SIZE  = 3.0;
 
-// Brightness from the camera POV: re-derive apparent magnitude using the
-// current camera-to-star distance. The size encodes intrinsic luminosity;
-// Three.js's perspective projection supplies the geometric 1/r factor, so
-// the on-screen flux ends up ∝ L / r² (correct R⁻² fall-off for the viewer).
-function sizeForAppMag(appMag, dim = false) {
-  const t = Math.min(Math.max((16 - appMag) / 22, 0), 1);
-  const base  = dim ? 0.04 : 0.08;
-  const range = dim ? 0.45 : 1.25;
-  let sz = base + t * range;
-  if (appMag < 0) sz *= 1 + Math.min(-appMag, 25) * 0.05;   // boost very bright
-  return Math.min(sz, 4.0);
+function sizeForAbsMag(absMag) {
+  const sz = REF_SIZE * Math.pow(10, 0.2 * (4.83 - absMag));
+  return Math.max(VIS_FLOOR, Math.min(sz, MAX_SIZE));
 }
 
 // ─── exoplanet classification ────────────────────────────────────────────
@@ -298,24 +304,28 @@ function applyMaskedSky() {
 }
 
 // ─── Sun ─────────────────────────────────────────────────────────────────
+// Sun absolute V-mag 4.83 (G2V). Color from the 5778 K blackbody chromaticity
+// (Charity D58 sRGB table) — not the eyeballed warm yellow it had before,
+// which was ~5200 K (border G/K).
 const SUN_ABS_MAG = 4.83;
 const starTex = makeStarTexture();
 const sun = new THREE.Sprite(new THREE.SpriteMaterial({
-  map: starTex, color: 0xfff1c8,
+  map: starTex, color: 0xfff2e0,
   transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+  opacity: 0.7,
 }));
-sun.scale.set(0.9, 0.9, 0.9);
 sun.userData = { name: 'Sol (the Sun)', distLy: 0, vmag: -26.74, sp: 'G2V', gx:0, gy:0, gz:0, isSun: true };
 scene.add(sun);
 
-// faint hint that the Sun is at the centre — a small billboarded ring
+// Faint "you are here" glow. Sized in proportion to the Sun sprite (which is
+// now scaled like any other G2V star), so the halo reads as a marker rather
+// than overwhelming the actual stellar disc.
 const sunHaloMat = new THREE.SpriteMaterial({
-  map: starTex, color: 0xffe18c,
-  transparent: true, opacity: 0.35,
+  map: starTex, color: 0xffe6a8,
+  transparent: true, opacity: 0.22,
   blending: THREE.AdditiveBlending, depthWrite: false,
 });
 const sunHalo = new THREE.Sprite(sunHaloMat);
-sunHalo.scale.set(2.4, 2.4, 2.4);
 scene.add(sunHalo);
 
 // ─── nearby stars (streamed in by loadStars()) ───────────────────────────
@@ -376,7 +386,7 @@ function addStarSprite(s) {
   const sprite = new THREE.Sprite(mat);
   sprite.position.set(p.x, p.y, p.z);
   const absMag = absMagFor(s.vmag ?? 99, s.distLy);
-  const sz = sizeForMag(s.vmag ?? 99, s.distLy, { dim: true }) * brightnessMul;
+  const sz = sizeForAbsMag(absMag) * brightnessMul;
   sprite.scale.set(sz, sz, sz);
   sprite.userData = { ...s, gx: p.x, gy: p.y, gz: p.z, absMag };
   // Stars are added in distance order; hide ones past the slider position at
@@ -513,22 +523,25 @@ let summaryTitle = 'Loading…';
 let summaryBody  = 'fetching star catalog';
 let pinnedSprite = null;
 
+function _row(k, v) {
+  return `<div class="k">${k}</div><div class="v">${v}</div>`;
+}
 function buildStarBody(d) {
-  const lines = [];
+  let html = '<div class="star-card">';
   if (d.isSun) {
-    lines.push(`our home star`);
-    lines.push(`apparent mag: ${d.vmag} · type: ${d.sp}`);
-    return lines.join('<br>');
+    html += _row('Type',       d.sp);
+    html += _row('App. mag',   d.vmag);
+    html += _row('Note',       'our home star');
+    return html + '</div>';
   }
-  lines.push(`distance: ${d.distLy.toFixed(3)} ly  (${(d.distLy/3.26156).toFixed(3)} pc)`);
-  const magLabel = d.isCurated ? 'V mag' : 'G mag';
-  const sp = d.sp || '—';
-  const bp = (d.bp_rp != null) ? ` · BP–RP ${d.bp_rp.toFixed(2)}` : '';
-  lines.push(`${magLabel}: ${d.vmag.toFixed(2)} · type: ${sp}${bp}`);
-  lines.push(`gal. XYZ: ${d.gx.toFixed(2)}, ${d.gy.toFixed(2)}, ${d.gz.toFixed(2)} ly`);
-  lines.push(`RA/Dec: ${d.ra.toFixed(3)}°, ${d.dec.toFixed(3)}°`);
+  html += _row('Distance', `${d.distLy.toFixed(3)} ly  ·  ${(d.distLy/3.26156).toFixed(3)} pc`);
+  html += _row(d.isCurated ? 'V mag' : 'G mag', d.vmag.toFixed(2));
+  html += _row('Type',      d.sp || '—');
+  if (d.bp_rp != null) html += _row('BP–RP', d.bp_rp.toFixed(2));
+  html += _row('Gal. XYZ',  `${d.gx.toFixed(2)}, ${d.gy.toFixed(2)}, ${d.gz.toFixed(2)} ly`);
+  html += _row('RA / Dec',  `${d.ra.toFixed(3)}°, ${d.dec.toFixed(3)}°`);
   if (d.planets && d.planets.length > 0) {
-    lines.push(`<span style="color:#6fe6c8">━ ${d.planets.length} planet${d.planets.length>1?'s':''} ━</span>`);
+    html += `<div class="section">Planet System <span class="count">· ${d.planets.length}</span></div>`;
     const orbitKey = (pl) => (
       pl.sma_au   != null ? pl.sma_au :
       pl.period_d != null ? Math.cbrt(pl.period_d * pl.period_d) :
@@ -541,12 +554,14 @@ function buildStarBody(d) {
       const a  = p.sma_au   != null ? `${p.sma_au.toFixed(3)} AU`   : null;
       const T  = p.period_d != null ? `${p.period_d.toFixed(p.period_d<10?2:1)} d` : null;
       const Te = p.eqt_k    != null ? `${Math.round(p.eqt_k)} K`     : null;
-      const bits = [r, m, a, T, Te].filter(Boolean).join(' · ');
-      lines.push(`  ${p.name}${bits ? ' — ' + bits : ''}`);
+      const bits = [r, m, a, T, Te].filter(Boolean).join(' · ') || '—';
+      html += `<div class="pname">${p.name}</div><div class="pdetail">${bits}</div>`;
     }
-    if (d.planets.length > 8) lines.push(`  …+${d.planets.length - 8} more`);
+    if (d.planets.length > 8) {
+      html += `<div class="more">…+${d.planets.length - 8} more</div>`;
+    }
   }
-  return lines.join('<br>');
+  return html + '</div>';
 }
 
 function renderInfoPanel() {
@@ -573,6 +588,48 @@ infoUnpin.addEventListener('click', (e) => { e.stopPropagation(); unpinStar(); }
 
 renderInfoPanel();
 
+// Great-circle angular separation between two RA/Dec points, in degrees.
+function angSepDeg(ra1, dec1, ra2, dec2) {
+  const D = Math.PI / 180;
+  const d1 = dec1 * D, d2 = dec2 * D;
+  const dRa  = (ra2 - ra1) * D;
+  const dDec = d2 - d1;
+  const a = Math.sin(dDec/2)**2 + Math.cos(d1) * Math.cos(d2) * Math.sin(dRa/2)**2;
+  return (2 * Math.asin(Math.min(1, Math.sqrt(a)))) / D;
+}
+
+// Merge each Gaia DR3 orphan that's the same star as a curated entry into
+// that curated entry: take the more recent (J2016) GAIA position, fill in
+// bp_rp / gaia_id, and move planets across. Match window is wide on the sky
+// (≤ 0.06° ≈ 216″ — covers Barnard's 16-yr proper motion) but tight on
+// distance (Δ < 0.02 ly), so unrelated stars never trip it.
+function dedupCuratedGaiaOrphans(stars) {
+  const drop = new Set();
+  let merged = 0, plMoved = 0;
+  for (const c of stars) {
+    if (!c.isCurated || c.distLy == null) continue;
+    for (const g of stars) {
+      if (g === c || g.isCurated || drop.has(g)) continue;
+      if (typeof g.name !== 'string' || !g.name.startsWith('Gaia DR3')) continue;
+      if (Math.abs(g.distLy - c.distLy) > 0.02) continue;
+      if (angSepDeg(c.ra, c.dec, g.ra, g.dec) > 0.06) continue;
+      if (c.bp_rp == null && g.bp_rp != null) c.bp_rp   = g.bp_rp;
+      if (!c.gaia_id && g.gaia_id)            c.gaia_id = g.gaia_id;
+      c.ra  = g.ra;
+      c.dec = g.dec;
+      if (g.planets && g.planets.length) {
+        c.planets = (c.planets || []).concat(g.planets);
+        plMoved  += g.planets.length;
+      }
+      drop.add(g);
+      merged++;
+      break;
+    }
+  }
+  if (merged) console.log(`[dedup] merged ${merged} GAIA orphans into curated stars (${plMoved} planets moved)`);
+  return drop.size ? stars.filter(s => !drop.has(s)) : stars;
+}
+
 async function loadStars() {
   let data;
   try {
@@ -581,6 +638,12 @@ async function loadStars() {
     setSummary('Failed to load catalog', e.message);
     return;
   }
+  // build_dataset.py's 60″ curated↔GAIA match misses high-proper-motion
+  // stars (J2000 SIMBAD vs J2016 GAIA — Barnard's, Proxima, Lalande 21185,
+  // Wolf 359, …). They leak through as "Gaia DR3 …" orphans, and
+  // attach_planets binds exoplanets to those orphans instead of the curated
+  // entry. Reunite them client-side until the catalog is rebuilt.
+  data = dedupCuratedGaiaOrphans(data);
   STARS = data;
   // Sort ascending by distance so the slider can slice "the N closest"
   // straight from starSprites. Curated stars naturally land near the front
@@ -595,6 +658,7 @@ async function loadStars() {
     const end = Math.min(i + CHUNK, data.length);
     for (let j = i; j < end; j++) addStarSprite(data[j]);
     setSummary('Loading…', `${end.toLocaleString()} / ${data.length.toLocaleString()} stars`);
+    refreshCountLabel(visibleStarCount);   // distLy of the Nth-closest grows as more stream in
     // Yield to the browser so each chunk is visible during load.
     await new Promise(r => requestAnimationFrame(r));
   }
@@ -677,7 +741,7 @@ function updateHover() {
   const hits = raycaster.intersectObjects(_hoverTargets, false);
   if (hits.length === 0) { hover.style.display = 'none'; return; }
   const d = hits[0].object.userData;
-  hover.innerHTML = `<b>${d.name}</b><br>` + buildStarBody(d);
+  hover.innerHTML = `<div class="hover-name">${d.name}</div>` + buildStarBody(d);
   hover.style.display = 'block';
   hover.style.left = (lastMouse.clientX + 14) + 'px';
   hover.style.top  = (lastMouse.clientY + 14) + 'px';
@@ -826,12 +890,15 @@ function applyStarSizes() {
   for (let i = 0; i < starSprites.length; i++) {
     const sp = starSprites[i];
     if (!sp.visible) continue;
-    const sz = sizeForAppMag(sp.userData.absMag, /* dim */ true) * brightnessMul;
+    const sz = sizeForAbsMag(sp.userData.absMag) * brightnessMul;
     sp.scale.set(sz, sz, sz);
   }
-  const sunSz = sizeForAppMag(SUN_ABS_MAG, false) * brightnessMul;
+  // Sun renders identically to any other G2V star — same absolute-magnitude
+  // → world-size conversion. The perspective 1/r factor turns this into a
+  // physical L/r² flux for the viewer.
+  const sunSz = sizeForAbsMag(SUN_ABS_MAG) * brightnessMul;
   sun.scale.set(sunSz, sunSz, sunSz);
-  sunHalo.scale.set(sunSz * 2.6, sunSz * 2.6, sunSz * 2.6);
+  sunHalo.scale.set(sunSz * 3.2, sunSz * 3.2, sunSz * 3.2);
 }
 
 function updateStarsForCamera() {
