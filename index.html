@@ -21,11 +21,33 @@
   .hint { opacity: .55; font-size: 12px; }
   #info {
     position: fixed; bottom: 14px; left: 14px; z-index: 10;
-    background: rgba(8,14,26,0.78); padding: 11px 14px; border-radius: 6px;
-    font-size: 13px; max-width: 380px; pointer-events: none;
+    background: rgba(8,14,26,0.82); border-radius: 6px;
+    font-size: 13px; max-width: 380px;
     border: 1px solid #1c2c46; backdrop-filter: blur(6px);
     line-height: 1.45;
   }
+  #info-head {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; padding: 9px 13px; cursor: pointer; user-select: none;
+  }
+  #info-title { font-weight: 600; }
+  #info-actions { display: flex; align-items: center; gap: 8px; }
+  #info-toggle {
+    display: inline-block; opacity: .55; font-size: 11px;
+    transition: transform .15s;
+  }
+  #info.collapsed #info-toggle { transform: rotate(-90deg); }
+  #info.collapsed #info-body { display: none; }
+  #info-body {
+    padding: 0 13px 11px 13px;
+    max-height: 60vh; overflow-y: auto;
+  }
+  #info-unpin {
+    background: rgba(50,95,150,0.35); color: #e8eef6;
+    border: 1px solid #4878a8; padding: 2px 9px; border-radius: 4px;
+    cursor: pointer; font-size: 11px;
+  }
+  #info-unpin:hover { background: rgba(70,115,180,0.6); }
   #hover {
     position: fixed; pointer-events: none; z-index: 11;
     background: rgba(8,14,26,0.92); padding: 8px 11px; border-radius: 4px;
@@ -84,12 +106,20 @@
     <button id="home" title="Reset view">⌂ Home</button>
     <button id="lines" title="Toggle Sun→star sightlines">⌖ Lines</button>
     <button id="plane" title="Toggle galactic-plane polar grid">⊕ Plane</button>
-    <button id="planets" class="active" title="Toggle exoplanet-host markers">○ Planets</button>
-    <button id="clouds" title="Toggle interstellar dust (Vergely+ 2022)">☁ Clouds</button>
-    <button id="probes" title="Toggle human-made interstellar probes">🛰 Probes</button>
+    <button id="planets" title="Toggle exoplanet-host markers">○ Exoplanets</button>
+    <button id="fullscreen" title="Toggle fullscreen">⛶ Fullscreen</button>
     <span class="hint">drag = rotate · wheel = zoom · right-drag = pan</span>
   </div>
-  <div id="info">Loading solar neighborhood…</div>
+  <div id="info">
+    <div id="info-head">
+      <span id="info-title">Loading…</span>
+      <span id="info-actions">
+        <button id="info-unpin" hidden>unpin</button>
+        <span id="info-toggle">▾</span>
+      </span>
+    </div>
+    <div id="info-body">fetching star catalog</div>
+  </div>
   <div id="hover"></div>
   <div id="scale">camera distance: <b id="viewdist">—</b></div>
   <div id="legend" hidden>
@@ -123,6 +153,6 @@
     }
   }
   </script>
-  <script type="module" src="./app.js?v=8"></script>
+  <script type="module" src="./app.js?v=9"></script>
 </body>
 </html>

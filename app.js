@@ -326,6 +326,7 @@ const starSprites = [];
 // 25000 matches the previous fixed-cutoff dataset count.
 let visibleStarCount = 25000;
 const planetHostRings = new THREE.Group();
+planetHostRings.visible = false;
 scene.add(planetHostRings);
 
 // Rings are LineLoops with FIXED world-radius in light-years. LineBasicMaterial
@@ -461,160 +462,6 @@ function updateSunLineOpacities() {
   }
 }
 
-// ─── interstellar dust volume (Vergely+ 2022, raymarched) ───────────────
-// Cube extent is in parsecs; world is in light-years. Vergely +Y is the
-// galactic-rotation direction; our galToXYZ uses -sin(l) so app +Y is the
-// anti-rotation direction. The shader flips Y when sampling the texture.
-const LY_PER_PC = 3.2615637769;
-const dustGroup = new THREE.Group();
-dustGroup.visible = false;
-scene.add(dustGroup);
-
-async function loadDustVolume() {
-  const meta = await fetch('./data/dust_cube.json').then(r => r.json());
-  const buf  = new Uint8Array(await fetch('./data/dust_cube.bin').then(r => r.arrayBuffer()));
-  const [nx, ny, nz] = meta.shape;
-  if (buf.length !== nx * ny * nz) {
-    console.warn('dust cube size mismatch', buf.length, nx * ny * nz);
-    return;
-  }
-
-  const tex = new THREE.Data3DTexture(buf, nx, ny, nz);
-  tex.format = THREE.RedFormat;
-  tex.type   = THREE.UnsignedByteType;
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  tex.wrapR = tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-  tex.unpackAlignment = 1;
-  tex.needsUpdate = true;
-
-  const ex = meta.extent_pc;
-  const texBoxSize = new THREE.Vector3(
-    (ex.x[1] - ex.x[0]) * LY_PER_PC,
-    (ex.y[1] - ex.y[0]) * LY_PER_PC,
-    (ex.z[1] - ex.z[0]) * LY_PER_PC,
-  );
-  // Render box starts at the full extent; setDustClipRadius() shrinks it to
-  // the visible-stars radius once stars finish loading. Texture lookup keeps
-  // using texBoxSize so we crop spatially without stretching the data.
-  const boxSize = texBoxSize.clone();
-
-  const mat = new THREE.ShaderMaterial({
-    uniforms: {
-      uDust:       { value: tex },
-      uBoxSize:    { value: boxSize },
-      uTexBoxSize: { value: texBoxSize },
-      uStepLy:     { value: 8.0 },
-      uMaxSteps:   { value: 160 },
-      uDensity:    { value: 0.005 },
-      uColor:      { value: new THREE.Color(0x9a8466) },
-    },
-    vertexShader: /* glsl */`
-      varying vec3 vLocal;
-      void main() {
-        vLocal = position;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: /* glsl */`
-      precision highp sampler3D;
-      uniform sampler3D uDust;
-      uniform vec3  uBoxSize;     // render AABB (clipped)
-      uniform vec3  uTexBoxSize;  // full data extent (texture mapping)
-      uniform float uStepLy;
-      uniform int   uMaxSteps;
-      uniform float uDensity;
-      uniform vec3  uColor;
-      varying vec3 vLocal;
-
-      vec2 intersectAABB(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {
-        vec3 inv = 1.0 / rd;
-        vec3 t0 = (bmin - ro) * inv;
-        vec3 t1 = (bmax - ro) * inv;
-        vec3 tmin = min(t0, t1);
-        vec3 tmax = max(t0, t1);
-        return vec2(max(max(tmin.x, tmin.y), tmin.z),
-                    min(min(tmax.x, tmax.y), tmax.z));
-      }
-
-      void main() {
-        // Ray in mesh-local coords. Mesh is at origin with no rotation, so
-        // local == world; this dodges an inverse(modelMatrix) per pixel.
-        vec3 ro = cameraPosition;
-        vec3 rd = normalize(vLocal - ro);
-        vec3 bmin = -uBoxSize * 0.5;
-        vec3 bmax =  uBoxSize * 0.5;
-        vec2 tt = intersectAABB(ro, rd, bmin, bmax);
-        float tStart = max(tt.x, 0.0);
-        float tEnd   = tt.y;
-        if (tEnd <= tStart) discard;
-
-        // Slight per-pixel jitter breaks visible slice banding.
-        float jitter = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
-        float t = tStart + jitter * uStepLy;
-
-        vec3 accumCol = vec3(0.0);
-        float accumA  = 0.0;
-        for (int i = 0; i < 512; i++) {
-          if (i >= uMaxSteps || t > tEnd || accumA > 0.985) break;
-          vec3 p = ro + rd * t;
-          // Vergely +Y is rotation; our +Y is anti-rotation → flip on lookup.
-          // Sampling against the FULL data extent, not the clipped render box,
-          // so shrinking uBoxSize crops the volume instead of stretching it.
-          vec3 uvw = vec3(
-             p.x / uTexBoxSize.x + 0.5,
-            -p.y / uTexBoxSize.y + 0.5,
-             p.z / uTexBoxSize.z + 0.5
-          );
-          float d = texture(uDust, uvw).r;
-          float a = 1.0 - exp(-d * uDensity * uStepLy);
-          accumCol += uColor * d * (1.0 - accumA) * a * 0.9;
-          accumA   += (1.0 - accumA) * a;
-          t += uStepLy;
-        }
-        gl_FragColor = vec4(accumCol, accumA);
-      }
-    `,
-    transparent: true,
-    depthWrite:  false,
-    depthTest:   true,
-    side:        THREE.BackSide,
-    blending:    THREE.NormalBlending,
-  });
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(boxSize.x, boxSize.y, boxSize.z), mat);
-  mesh.renderOrder = 5;
-  dustGroup.add(mesh);
-  dustGroup.userData = { mesh, boxSize, texBoxSize };
-  // Match initial clip to whatever the visible-stars radius is right now (may
-  // still be the placeholder if stars haven't streamed in yet — that path is
-  // handled by refreshDustClipFromStars()).
-  refreshDustClipFromStars();
-  console.log('[dust] cube loaded', { shape: meta.shape, texBoxSize, log: meta.log_norm });
-}
-
-// Clip the rendered dust AABB to the slider's current visible-stars radius.
-// `radiusLy` is half the box edge on X/Y; Z stays at the Vergely cube extent
-// since the dust slab is only ±400 pc thick and clipping it shorter would hide
-// most clouds when looking out the galactic plane.
-function setDustClipRadius(radiusLy) {
-  const u = dustGroup.userData;
-  if (!u || !u.mesh) return;
-  const tex = u.texBoxSize;
-  const rxy = Math.max(50, Math.min(radiusLy, tex.x * 0.5));
-  const sxy = rxy * 2;
-  u.boxSize.set(sxy, sxy, tex.z);
-  u.mesh.geometry.dispose();
-  u.mesh.geometry = new THREE.BoxGeometry(sxy, sxy, tex.z);
-}
-
-function refreshDustClipFromStars() {
-  if (!dustGroup.userData.mesh) return;
-  const eff = Math.min(visibleStarCount, starSprites.length);
-  if (eff <= 0) return;
-  const r = starSprites[eff - 1].userData.distLy;
-  setDustClipRadius(r);
-}
-
 // ─── Sun-centered radial grid on galactic plane (toggle) ────────────────
 // Concentric circles every 20 ly out to 200 ly (400 ly diameter) + 12 radial
 // spokes. Brighter green for visibility against the dense star field.
@@ -656,15 +503,82 @@ scene.add(galPlane);
 })();
 
 // ─── info panel ──────────────────────────────────────────────────────────
-const info = document.getElementById('info');
-info.innerHTML = `<b>Loading…</b><br><span class="hint">fetching star catalog</span>`;
+const infoEl    = document.getElementById('info');
+const infoHead  = document.getElementById('info-head');
+const infoTitle = document.getElementById('info-title');
+const infoBody  = document.getElementById('info-body');
+const infoUnpin = document.getElementById('info-unpin');
+
+let summaryTitle = 'Loading…';
+let summaryBody  = 'fetching star catalog';
+let pinnedSprite = null;
+
+function buildStarBody(d) {
+  const lines = [];
+  if (d.isSun) {
+    lines.push(`our home star`);
+    lines.push(`apparent mag: ${d.vmag} · type: ${d.sp}`);
+    return lines.join('<br>');
+  }
+  lines.push(`distance: ${d.distLy.toFixed(3)} ly  (${(d.distLy/3.26156).toFixed(3)} pc)`);
+  const magLabel = d.isCurated ? 'V mag' : 'G mag';
+  const sp = d.sp || '—';
+  const bp = (d.bp_rp != null) ? ` · BP–RP ${d.bp_rp.toFixed(2)}` : '';
+  lines.push(`${magLabel}: ${d.vmag.toFixed(2)} · type: ${sp}${bp}`);
+  lines.push(`gal. XYZ: ${d.gx.toFixed(2)}, ${d.gy.toFixed(2)}, ${d.gz.toFixed(2)} ly`);
+  lines.push(`RA/Dec: ${d.ra.toFixed(3)}°, ${d.dec.toFixed(3)}°`);
+  if (d.planets && d.planets.length > 0) {
+    lines.push(`<span style="color:#6fe6c8">━ ${d.planets.length} planet${d.planets.length>1?'s':''} ━</span>`);
+    const orbitKey = (pl) => (
+      pl.sma_au   != null ? pl.sma_au :
+      pl.period_d != null ? Math.cbrt(pl.period_d * pl.period_d) :
+      Infinity
+    );
+    const ordered = [...d.planets].sort((a, b) => orbitKey(a) - orbitKey(b));
+    for (const p of ordered.slice(0, 8)) {
+      const r  = p.radius_e != null ? `${p.radius_e.toFixed(2)} R⊕` : null;
+      const m  = p.mass_e   != null ? `${p.mass_e.toFixed(2)} M⊕`   : null;
+      const a  = p.sma_au   != null ? `${p.sma_au.toFixed(3)} AU`   : null;
+      const T  = p.period_d != null ? `${p.period_d.toFixed(p.period_d<10?2:1)} d` : null;
+      const Te = p.eqt_k    != null ? `${Math.round(p.eqt_k)} K`     : null;
+      const bits = [r, m, a, T, Te].filter(Boolean).join(' · ');
+      lines.push(`  ${p.name}${bits ? ' — ' + bits : ''}`);
+    }
+    if (d.planets.length > 8) lines.push(`  …+${d.planets.length - 8} more`);
+  }
+  return lines.join('<br>');
+}
+
+function renderInfoPanel() {
+  if (pinnedSprite) {
+    infoTitle.textContent = pinnedSprite.userData.name;
+    infoBody.innerHTML = buildStarBody(pinnedSprite.userData);
+    infoUnpin.hidden = false;
+  } else {
+    infoTitle.textContent = summaryTitle;
+    infoBody.innerHTML = summaryBody;
+    infoUnpin.hidden = true;
+  }
+}
+function setSummary(title, body) {
+  summaryTitle = title;
+  summaryBody = body;
+  if (!pinnedSprite) renderInfoPanel();
+}
+function pinStar(sprite) { pinnedSprite = sprite; renderInfoPanel(); }
+function unpinStar()     { pinnedSprite = null;   renderInfoPanel(); }
+
+infoHead.addEventListener('click', () => infoEl.classList.toggle('collapsed'));
+infoUnpin.addEventListener('click', (e) => { e.stopPropagation(); unpinStar(); });
+
+renderInfoPanel();
 
 async function loadStars() {
   let data;
   try {
     data = await fetch('./data/stars.json?v=' + Date.now(), { cache: 'no-store' }).then(r => r.json());
   } catch (e) {
-    info.innerHTML = `<b>Failed to load catalog</b><br><span class="hint">${e.message}</span>`;
+    setSummary('Failed to load catalog', e.message);
     return;
   }
   STARS = data;
@@ -680,9 +594,7 @@ async function loadStars() {
   for (let i = 0; i < data.length; i += CHUNK) {
     const end = Math.min(i + CHUNK, data.length);
     for (let j = i; j < end; j++) addStarSprite(data[j]);
-    info.innerHTML =
-      `<b>Loading…</b> ${end} / ${data.length}<br>` +
-      `<span class="hint">${data.length - end > 0 ? 'building scene' : 'finishing up'}</span>`;
+    setSummary('Loading…', `${end.toLocaleString()} / ${data.length.toLocaleString()} stars`);
     // Yield to the browser so each chunk is visible during load.
     await new Promise(r => requestAnimationFrame(r));
   }
@@ -703,14 +615,12 @@ async function loadStars() {
   const nHosts   = data.filter(s => s.planets && s.planets.length).length;
   const nPlanets = data.reduce((a, s) => a + (s.planets?.length || 0), 0);
   const maxDist  = data[data.length - 1].distLy;
-  info.innerHTML =
-    `<b>Solar Neighborhood</b><br>` +
+  setSummary(
+    'Solar Neighborhood',
     `${data.length.toLocaleString()} stars within ~${Math.round(maxDist)} ly ` +
     `(${nCurated} curated + ${nGaia.toLocaleString()} from GAIA DR3)<br>` +
-    `${nPlanets} confirmed exoplanets around ${nHosts} hosts — one orbit ring per planet.<br>` +
-    `<span class="hint">slider = visible-count · brightness updates with POV · hover for details</span>`;
-
-  document.getElementById('legend').hidden = false;
+    `${nPlanets} confirmed exoplanets around ${nHosts} hosts.`,
+  );
 }
 
 // ─── slider: show the N closest stars ────────────────────────────────────
@@ -750,6 +660,14 @@ renderer.domElement.addEventListener('mousemove', (e) => {
 });
 renderer.domElement.addEventListener('mouseleave', () => { lastMouse = null; hover.style.display = 'none'; });
 
+function pickSprite(clientX, clientY) {
+  mouse.x =  (clientX / window.innerWidth)  * 2 - 1;
+  mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const hits = raycaster.intersectObjects(_hoverTargets, false);
+  return hits.length > 0 ? hits[0].object : null;
+}
+
 function updateHover() {
   if (!lastMouse) { hover.style.display = 'none'; return; }
   raycaster.setFromCamera(mouse, camera);
@@ -759,128 +677,30 @@ function updateHover() {
   const hits = raycaster.intersectObjects(_hoverTargets, false);
   if (hits.length === 0) { hover.style.display = 'none'; return; }
   const d = hits[0].object.userData;
-  const lines = [`<b>${d.name}</b>`];
-  if (d.isSun) {
-    lines.push(`our home star`);
-    lines.push(`apparent mag: ${d.vmag} · type: ${d.sp}`);
-  } else if (d.isProbe) {
-    lines.push(`<span class="hint">human-made spacecraft</span>`);
-    lines.push(`launched: ${d.launch}`);
-    lines.push(`distance: ${d.distAu.toLocaleString()} AU  (${(d.distLy * 1000).toFixed(3)} mly)`);
-    lines.push(`escape speed: ${d.spdAuYr} AU/yr`);
-    if (d.lostContact) lines.push(`<span class="hint">contact lost ${d.lostContact}</span>`);
-    lines.push(`heading: ${d.target}`);
-  } else {
-    lines.push(`distance: ${d.distLy.toFixed(3)} ly  (${(d.distLy/3.26156).toFixed(3)} pc)`);
-    const magLabel = d.isCurated ? 'V mag' : 'G mag';
-    const sp = d.sp || '—';
-    const bp = (d.bp_rp != null) ? ` · BP–RP ${d.bp_rp.toFixed(2)}` : '';
-    lines.push(`${magLabel}: ${d.vmag.toFixed(2)} · type: ${sp}${bp}`);
-    lines.push(`gal. XYZ: ${d.gx.toFixed(2)}, ${d.gy.toFixed(2)}, ${d.gz.toFixed(2)} ly`);
-    lines.push(`RA/Dec: ${d.ra.toFixed(3)}°, ${d.dec.toFixed(3)}°`);
-    if (d.planets && d.planets.length > 0) {
-      lines.push(`<span style="color:#6fe6c8">━ ${d.planets.length} planet${d.planets.length>1?'s':''} ━</span>`);
-      const orbitKey = (pl) => (
-        pl.sma_au   != null ? pl.sma_au :
-        pl.period_d != null ? Math.cbrt(pl.period_d * pl.period_d) :
-        Infinity
-      );
-      const ordered = [...d.planets].sort((a, b) => orbitKey(a) - orbitKey(b));
-      for (const p of ordered.slice(0, 8)) {
-        const r  = p.radius_e != null ? `${p.radius_e.toFixed(2)} R⊕` : null;
-        const m  = p.mass_e   != null ? `${p.mass_e.toFixed(2)} M⊕`   : null;
-        const a  = p.sma_au   != null ? `${p.sma_au.toFixed(3)} AU`   : null;
-        const T  = p.period_d != null ? `${p.period_d.toFixed(p.period_d<10?2:1)} d` : null;
-        const Te = p.eqt_k    != null ? `${Math.round(p.eqt_k)} K`     : null;
-        const bits = [r, m, a, T, Te].filter(Boolean).join(' · ');
-        lines.push(`  ${p.name}${bits ? ' — ' + bits : ''}`);
-      }
-      if (d.planets.length > 8) lines.push(`  …+${d.planets.length - 8} more`);
-    }
-  }
-  hover.innerHTML = lines.join('<br>');
+  hover.innerHTML = `<b>${d.name}</b><br>` + buildStarBody(d);
   hover.style.display = 'block';
   hover.style.left = (lastMouse.clientX + 14) + 'px';
   hover.style.top  = (lastMouse.clientY + 14) + 'px';
 }
 
-// ─── interstellar probes ───────────────────────────────────────────────
-// Five spacecraft on hyperbolic escape trajectories. Distances and asymptotic
-// heading vectors are approximate as of June 2026 (Voyager/NH telemetry,
-// Pioneers extrapolated forward from their last contacts). Past path is shown
-// as a solid line from the Sun to the current position (a fine simplification
-// at this zoom — all gravity-assist wiggling happened inside ~100 AU); future
-// projection is a dashed extension capped at PROBE_FUTURE_CAP_AU because the
-// orbit is hyperbolic and extends to infinity otherwise.
-const LY_PER_AU = 1.58125074e-5;
-const PROBE_FUTURE_CAP_AU = 50000;  // ~0.79 ly forward — visible at local-neighbourhood zoom
-const PROBES = [
-  { name: 'Voyager 1',    launch: '1977-09-05', distAu: 167, ra: 258.5, dec:  12, spdAuYr: 3.58, color: 0xff9466, target: 'Gliese 445 flyby in ~40,000 yr (Ophiuchus)' },
-  { name: 'Voyager 2',    launch: '1977-08-20', distAu: 141, ra: 298.0, dec: -55, spdAuYr: 3.24, color: 0xffc066, target: 'Ross 248 flyby in ~40,000 yr (Telescopium)' },
-  { name: 'Pioneer 10',   launch: '1972-03-03', distAu: 136, ra:  76.0, dec:  26, spdAuYr: 2.51, color: 0x9cb8ff, target: 'Aldebaran direction (~2 Myr)', lostContact: 2003 },
-  { name: 'Pioneer 11',   launch: '1973-04-06', distAu: 115, ra: 283.0, dec:  -8, spdAuYr: 2.36, color: 0xaae6ff, target: 'λ Aquilae direction', lostContact: 1995 },
-  { name: 'New Horizons', launch: '2006-01-19', distAu:  63, ra: 292.0, dec: -20, spdAuYr: 2.93, color: 0xff7aa0, target: 'galactic-anticenter region' },
-];
-const probesGroup = new THREE.Group();
-probesGroup.visible = false;
-scene.add(probesGroup);
-const probeMarkers = [];
-
-function makeProbeDotTex() {
-  const size = 64;
-  const c = document.createElement('canvas');
-  c.width = c.height = size;
-  const ctx = c.getContext('2d');
-  const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
-  g.addColorStop(0.0, 'rgba(255,255,255,1)');
-  g.addColorStop(0.35, 'rgba(255,255,255,0.55)');
-  g.addColorStop(1.0, 'rgba(255,255,255,0)');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, size, size);
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
-}
-const probeDotTex = makeProbeDotTex();
-
-for (const p of PROBES) {
-  const { l, b } = eqToGal(p.ra, p.dec);
-  const dir = galToXYZ(l, b, 1.0);            // unit vector in app world coords
-  const curLy = p.distAu * LY_PER_AU;
-  const capLy = curLy + PROBE_FUTURE_CAP_AU * LY_PER_AU;
-  const curPos = new THREE.Vector3(dir.x * curLy, dir.y * curLy, dir.z * curLy);
-  const capPos = new THREE.Vector3(dir.x * capLy, dir.y * capLy, dir.z * capLy);
-
-  const past = new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), curPos]),
-    new THREE.LineBasicMaterial({ color: p.color, transparent: true, opacity: 0.85 }),
-  );
-
-  // LineDashedMaterial dash/gap are in WORLD units. Future leg is ~0.79 ly; a
-  // ~0.012 ly dash gives ~65 segments — readable as a dashed line at all but
-  // extreme zoom-out. computeLineDistances() is required for dashes to show.
-  const fut = new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints([curPos, capPos]),
-    new THREE.LineDashedMaterial({
-      color: p.color, transparent: true, opacity: 0.55,
-      dashSize: 0.012, gapSize: 0.008,
-    }),
-  );
-  fut.computeLineDistances();
-
-  const marker = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: probeDotTex, color: p.color,
-    transparent: true, blending: THREE.AdditiveBlending,
-    depthWrite: false, opacity: 0.95,
-  }));
-  marker.position.copy(curPos);
-  marker.userData = { ...p, isProbe: true, distLy: curLy };
-  marker.visible = false;  // synced with probesGroup by the Probes toggle
-
-  probesGroup.add(past, fut, marker);
-  probeMarkers.push(marker);
-  _hoverTargets.push(marker);
-}
+// ─── click-to-pin star info ──────────────────────────────────────────────
+// Track pointerdown vs pointerup delta to distinguish a click from an
+// OrbitControls drag — only treat near-stationary releases as picks.
+let _pointerDownAt = null;
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+  _pointerDownAt = { x: e.clientX, y: e.clientY, t: performance.now() };
+});
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (e.button !== 0 || !_pointerDownAt) return;
+  const dx = e.clientX - _pointerDownAt.x;
+  const dy = e.clientY - _pointerDownAt.y;
+  const dt = performance.now() - _pointerDownAt.t;
+  _pointerDownAt = null;
+  if (dx*dx + dy*dy > 25 || dt > 500) return;  // drag, not click
+  const hit = pickSprite(e.clientX, e.clientY);
+  if (hit) pinStar(hit);
+});
 
 // ─── home button (smooth easing back to start) ───────────────────────────
 function animateCameraTo(pos, target, duration = 800) {
@@ -921,17 +741,13 @@ planetsBtn.addEventListener('click', () => {
   legendEl.hidden = !planetHostRings.visible;
 });
 
-const cloudsBtn = document.getElementById('clouds');
-cloudsBtn.addEventListener('click', () => {
-  dustGroup.visible = !dustGroup.visible;
-  cloudsBtn.classList.toggle('active', dustGroup.visible);
+const fsBtn = document.getElementById('fullscreen');
+fsBtn.addEventListener('click', () => {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+  else document.exitFullscreen();
 });
-
-const probesBtn = document.getElementById('probes');
-probesBtn.addEventListener('click', () => {
-  probesGroup.visible = !probesGroup.visible;
-  for (const m of probeMarkers) m.visible = probesGroup.visible;
-  probesBtn.classList.toggle('active', probesGroup.visible);
+document.addEventListener('fullscreenchange', () => {
+  fsBtn.classList.toggle('active', !!document.fullscreenElement);
 });
 
 // ─── visible-count slider (log-scale 100 → 100,000, default 25,000) ──────
@@ -954,7 +770,6 @@ function refreshCountLabel(n) {
   } else {
     rangeLabel.textContent = '— ly';
   }
-  refreshDustClipFromStars();
 }
 countSlider.addEventListener('input', () => {
   const n = sliderToCount(+countSlider.value);
@@ -1029,18 +844,6 @@ function updateStarsForCamera() {
   for (const ring of planetHostRings.children) {
     ring.quaternion.copy(camera.quaternion);
   }
-
-  // Constant-screen-size probe markers. Without this, the dots sit at sub-
-  // thousandth-ly positions and are invisible from any practical zoom level.
-  // Clamp so they don't grow unbounded at far zoom-out or shrink to a single
-  // pixel when the camera flies inside the cluster.
-  if (probesGroup.visible) {
-    for (const m of probeMarkers) {
-      const dCam = Math.max(_camPos.distanceTo(m.position), 0.001);
-      const sz = Math.min(Math.max(dCam * 0.014, 0.0008), 5);
-      m.scale.set(sz, sz, sz);
-    }
-  }
 }
 
 // ─── main loop ───────────────────────────────────────────────────────────
@@ -1058,4 +861,3 @@ loop();
 
 // Kick off streaming load after the first frame is rendered.
 loadStars();
-loadDustVolume().catch(e => console.warn('[dust] load failed', e));
