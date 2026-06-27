@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Milky Way Map</title>
+<link rel="icon" type="image/svg+xml" href="./favicon.svg">
+<meta name="theme-color" content="#02041a">
 <style>
   html, body { margin: 0; padding: 0; background: #000; color: #e8eef6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; overflow: hidden; height: 100%; }
   canvas { display: block; }
@@ -146,8 +148,12 @@
     button { padding: 7px 10px; font-size: 12px; }
     #scale {
       top: 8px; right: 8px;
-      padding: 6px 9px; font-size: 11px;
+      padding: 5px 8px; font-size: 11px;
     }
+    /* Drop the verbose label on mobile so the widget stays inside the
+       right-edge reserve and doesn't overlap the wrapped toolbar. */
+    #scale .lbl { display: none; }
+    #scale::before { content: '↔ '; opacity: .55; }
     #legend { display: none; }                /* card overlap + low value on mobile */
 
     #countbar {
@@ -200,7 +206,7 @@
     <div id="info-body">fetching star catalog</div>
   </div>
   <div id="hover"></div>
-  <div id="scale">camera distance: <b id="viewdist">—</b></div>
+  <div id="scale"><span class="lbl">camera distance: </span><b id="viewdist">—</b></div>
   <div id="legend" hidden>
     <div class="title">Planet types</div>
     <div class="row"><span class="dot" style="background:#facc15"></span>rocky</div>
